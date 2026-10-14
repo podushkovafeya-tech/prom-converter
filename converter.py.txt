@@ -1,0 +1,112 @@
+import os
+import requests
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from flask import Flask, send_from_directory
+
+app = Flask(__name__)
+XML_DIR = "/tmp" if os.environ.get("RENDER") else "."
+XML_FILENAME = "prom_import.xml"
+XML_PATH = os.path.join(XML_DIR, XML_FILENAME)
+
+def run_conversion():
+    URL = "https://bedroom-online.com.ua/storage/extended-xmls/svtextile-2.xml"
+    print(f"[{datetime.now()}] Запуск завантаження оригінального файлу...")
+    
+    try:
+        response = requests.get(URL, timeout=60)
+        response.encoding = 'utf-8'
+        if response.status_code != 200:
+            print(f"Помилка завантаження. Статус: {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"Виникла помилка при запиті: {e}")
+        return False
+
+    print("Парсинг та трансформація структури під Prom.ua...")
+    try:
+        root = ET.fromstring(response.text)
+    except Exception as e:
+        print(f"Помилка парсингу XML: {e}")
+        return False
+
+    current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    yml_catalog = ET.Element("yml_catalog", date=current_date)
+    shop = ET.SubElement(yml_catalog, "shop")
+    
+    # Загальні теги магазину
+    ET.SubElement(shop, "name").text = "Bedroom Online Store"
+    ET.SubElement(shop, "company").text = "Bedroom Online"
+    ET.SubElement(shop, "url").text = "https://prom.ua"
+    
+    currencies = ET.SubElement(shop, "currencies")
+    ET.SubElement(currencies, "currency", id="UAH", rate="1")
+    
+    # Імпорт дерева категорій
+    categories = ET.SubElement(shop, "categories")
+    catalog_source = root.find("catalog")
+    if catalog_source is not None:
+        for cat in catalog_source.findall("category"):
+            cat_id = cat.get("id")
+            parent_id = cat.get("parent")
+            cat_elem = ET.SubElement(categories, "category", id=cat_id)
+            if parent_id:
+                cat_elem.set("parentId", parent_id)
+            cat_elem.text = cat.find("name").text if cat.find("name") is not None else "Без назви"
+            
+    # Трансформація товарів (Offers)
+    offers = ET.SubElement(shop, "offers")
+    items_source = root.find("items")
+    
+    if items_source is not None:
+        for item in items_source.findall("item"):
+            item_id = item.get("id")
+            
+            # Конвертація наявності: "Заказ" або "В наличии" -> available="true"
+            avail_node = item.find("available")
+            avail_text = avail_node.text if avail_node is not None else "false"
+            is_available = "true" if avail_text.lower() in ["заказ", "в наличии", "true", "1"] else "false"
+            
+            offer = ET.SubElement(offers, "offer", id=item_id, available=is_available)
+            
+            # Збирання стандартних полів товарів
+            ET.SubElement(offer, "name").text = item.find("name").text if item.find("name") is not None else ""
+            ET.SubElement(offer, "price").text = item.find("price").text if item.find("price") is not None else "0"
+            ET.SubElement(offer, "currencyId").text = "UAH"
+            ET.SubElement(offer, "categoryId").text = item.find("categoryId").text if item.find("categoryId") is not None else ""
+            
+            if item.find("article") is not None:
+                ET.SubElement(offer, "vendorCode").text = item.find("article").text
+            if item.find("vendor") is not None:
+                ET.SubElement(offer, "vendor").text = item.find("vendor").text
+                
+            # Збір множинних зображень і конвертація у формат <picture>
+            for img in item.findall("image"):
+                if img.text and img.text.strip():
+                    ET.SubElement(offer, "picture").text = img.text.strip()
+                    
+            if item.find("description") is not None:
+                ET.SubElement(offer, "description").text = item.find("description").text
+                
+            # Збереження характеристик товарів
+            for param in item.findall("param"):
+                p_name = param.get("name")
+                param_elem = ET.SubElement(offer, "param", name=p_name)
+                param_elem.text = param.text
+
+    tree = ET.ElementTree(yml_catalog)
+    tree.write(XML_PATH, encoding="utf-8", xml_declaration=True)
+    print(f"Файл успішно збережено за шляхом: {XML_PATH}")
+    return True
+
+# Ендпоінт веб-сервера для видачі XML файлу або динамічного оновлення
+@app.route("/")
+def get_xml():
+    # Робимо динамічний перерахунок при кожному зверненні Prom.ua
+    run_conversion()
+    return send_from_directory(XML_DIR, XML_FILENAME, mimetype="application/xml")
+
+if __name__ == "__main__":
+    # Локальний запуск або запуск через WSGI
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
